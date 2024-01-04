@@ -13,7 +13,7 @@
 #ifndef DRAGON_OPERATORS_SWIGLU_OP_H_
 #define DRAGON_OPERATORS_SWIGLU_OP_H_
 
-#include "dragon/core/operator.h"
+#include <dragon/core/operator.h>
 
 namespace dragon {
 
@@ -47,4 +47,4 @@ class SwiGLUGradientOp : public Operator<Context> {
 
 } // namespace dragon
 
-#endif // DRAGON_OPERATORS_ACTIVATION_SILU_OP_H_
+#endif // DRAGON_OPERATORS_SWIGLU_OP_H_

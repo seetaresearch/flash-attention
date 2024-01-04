@@ -34,18 +34,13 @@ void SwiGLUGradientOp<Context>::DoRunWithType() {
 DEPLOY_CUDA_OPERATOR(SwiGLU);
 DEPLOY_CUDA_OPERATOR(SwiGLUGradient);
 #endif
+#ifdef USE_MLU
+DEPLOY_MLU_OPERATOR(SwiGLU);
+DEPLOY_MLU_OPERATOR(SwiGLUGradient);
+#endif
 
-OPERATOR_SCHEMA(SwiGLU)
-    /* X */
-    .NumInputs(1)
-    /* Y */
-    .NumOutputs(1);
-
-OPERATOR_SCHEMA(SwiGLUGradient)
-    /* X, dY */
-    .NumInputs(2)
-    /* dX */
-    .NumOutputs(1);
+OPERATOR_SCHEMA(SwiGLU).NumInputs(1).NumOutputs(1);
+OPERATOR_SCHEMA(SwiGLUGradient).NumInputs(2).NumOutputs(1);
 
 REGISTER_GRADIENT(SwiGLU, GenericGradientMaker);
 
