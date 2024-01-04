@@ -1,0 +1,99 @@
+#include <dragon/utils/math_functions.h>
+#include "../../../kernels/rotary/op_kernels.h"
+
+namespace dragon {
+
+namespace kernels {
+
+namespace {
+
+template <typename T, int BlockThreads>
+__mlu_entry__ void _RotarySeqLast(
+    const int NxH,
+    const int LxD_halve,
+    const bool conjugate,
+    const T* xq,
+    const T* xk,
+    const T* cosw,
+    const T* sinw,
+    T* yq,
+    T* yk) {
+  __mlu_shared__ T W_shared[2 * BlockThreads];
+  __nram__ T X[2 * BlockThreads], W[2 * BlockThreads], Y[2 * BlockThreads];
+  for (int j = 0; j < LxD_halve; j += BlockThreads) {
+    const int C_ram = std::min(LxD_halve - j, BlockThreads);
+    const unsigned int C_ramsize = C_ram * sizeof(T);
+    T *X0 = X, *W0 = W, *Y0 = Y;
+    T *X1 = X + C_ram, *W1 = W + C_ram, *Y1 = Y + C_ram;
+    __memcpy(W_shared, cosw + j, C_ramsize, GDRAM2SRAM);
+    __memcpy(W_shared + C_ram, sinw + j, C_ramsize, GDRAM2SRAM);
+    __sync_cluster();
+    __memcpy(W, W_shared, C_ramsize * 2, SRAM2NRAM);
+    for (int i = taskId; i < NxH; i += taskDim) { // clang-format off
+      // XQ -> YQ
+      __memcpy(Y, xq + i * LxD_halve * 2 + j, C_ramsize * 2, GDRAM2NRAM);
+      __bang_transpose(X, Y, C_ram, 2);
+      __bang_mul(Y0, X1, W1, C_ram); // y0 = x0 * cos [-/+] x1 * sin
+      __bang_fusion(conjugate ? FUSION_FMA : FUSION_FMS, Y0, X0, W0, Y0, C_ram, C_ram);
+      __bang_mul(Y1, X0, W1, C_ram); // y1 = x1 * cos [+/-] x0 * sin
+      __bang_fusion(conjugate ? FUSION_FMS : FUSION_FMA, Y1, X1, W0, Y1, C_ram, C_ram);
+      __bang_transpose(X, Y, 2, C_ram); // y = cat(y0, y1)
+      __memcpy(yq + i * LxD_halve * 2 + j, X, C_ramsize * 2, NRAM2GDRAM);
+      // XK -> YK
+      __memcpy(Y, xk + i * LxD_halve * 2 + j, C_ramsize * 2, GDRAM2NRAM);
+      __bang_transpose(X, Y, C_ram, 2);
+      __bang_mul(Y0, X1, W1, C_ram); // y0 = x0 * cos [-/+] x1 * sin
+      __bang_fusion(conjugate ? FUSION_FMA : FUSION_FMS, Y0, X0, W0, Y0, C_ram, C_ram);
+      __bang_mul(Y1, X0, W1, C_ram); // y1 = x1 * cos [+/-] x0 * sin
+      __bang_fusion(conjugate ? FUSION_FMS : FUSION_FMA, Y1, X1, W0, Y1, C_ram, C_ram);
+      __bang_transpose(X, Y, 2, C_ram); // y = cat(y0, y1)
+      __memcpy(yk + i * LxD_halve * 2 + j, X, C_ramsize * 2, NRAM2GDRAM);
+    } // clang-format on
+  }
+}
+
+} // namespace
+
+#define DEFINE_KERNEL_LAUNCHER(T, kBlockThreads)                           \
+  template <>                                                              \
+  void Rotary<T, MLUContext>(                                              \
+      const int N,                                                         \
+      const int L,                                                         \
+      const int H,                                                         \
+      const int D,                                                         \
+      const bool conjugate,                                                \
+      const string& data_format,                                           \
+      const T* xq,                                                         \
+      const T* xk,                                                         \
+      const T* cosw,                                                       \
+      const T* sinw,                                                       \
+      T* yq,                                                               \
+      T* yk,                                                               \
+      MLUContext* ctx) {                                                   \
+    const auto NxH = N * H, LxD_halve = L * D / 2;                         \
+    if (data_format == "NLHD") {                                           \
+      NOT_IMPLEMENTED;                                                     \
+    } else {                                                               \
+      _RotarySeqLast<math::Traits<T>::scalar_type, kBlockThreads>          \
+          <<<MLU_BLOCKS(), CNRT_FUNC_TYPE_UNION1, ctx->mlu_stream()>>>(    \
+              NxH,                                                         \
+              LxD_halve,                                                   \
+              conjugate,                                                   \
+              reinterpret_cast<const math::Traits<T>::scalar_type*>(xq),   \
+              reinterpret_cast<const math::Traits<T>::scalar_type*>(xk),   \
+              reinterpret_cast<const math::Traits<T>::scalar_type*>(cosw), \
+              reinterpret_cast<const math::Traits<T>::scalar_type*>(sinw), \
+              reinterpret_cast<math::Traits<T>::scalar_type*>(yq),         \
+              reinterpret_cast<math::Traits<T>::scalar_type*>(yk));        \
+    }                                                                      \
+  }
+
+DEFINE_KERNEL_LAUNCHER(float16, 40960);
+DEFINE_KERNEL_LAUNCHER(bfloat16, 40960);
+DEFINE_KERNEL_LAUNCHER(float, 30720);
+DEFINE_KERNEL_LAUNCHER(double, 30720);
+#undef DEFINE_KERNEL_LAUNCHER
+
+} // namespace kernels
+
+} // namespace dragon

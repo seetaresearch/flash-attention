@@ -1,0 +1,104 @@
+#include <dragon/utils/math_functions.h>
+#include "../../../kernels/kv_cache/op_kernels.h"
+
+namespace dragon {
+
+namespace kernels {
+
+namespace {
+
+#define BLOCK_THREADS 40960
+
+template <typename T>
+__mlu_entry__ void _KVCacheSeqLast(
+    const int NxH,
+    const int L,
+    const int D,
+    const int seqlen,
+    const int max_seqlen,
+    const T* xk,
+    const T* xv,
+    T* cache_k,
+    T* cache_v,
+    T* yk,
+    T* yv) {
+  __nram__ T Y[BLOCK_THREADS];
+  const int row_stride = seqlen * D, max_row_stride = max_seqlen * D;
+  const int x_row_stride = (L - seqlen) * D, y_row_stride = L * D;
+  for (int i = taskId; i < NxH; i += taskDim) {
+    for (int j = 0; j < row_stride; j += BLOCK_THREADS) {
+      const int C_ram = std::min(row_stride - j, BLOCK_THREADS);
+      const unsigned int C_ramsize = C_ram * sizeof(T);
+      // YK <- CacheK
+      __memcpy(Y, cache_k + i * max_row_stride + j, C_ramsize, GDRAM2NRAM);
+      __memcpy(yk + i * y_row_stride + j, Y, C_ramsize, NRAM2GDRAM);
+      // YV <- CacheV
+      __memcpy(Y, cache_v + i * max_row_stride + j, C_ramsize, GDRAM2NRAM);
+      __memcpy(yv + i * y_row_stride + j, Y, C_ramsize, NRAM2GDRAM);
+    }
+    for (int j = 0; j < x_row_stride; j += BLOCK_THREADS) {
+      const int k = row_stride + j;
+      const int C_ram = std::min(x_row_stride - j, BLOCK_THREADS);
+      const unsigned int C_ramsize = C_ram * sizeof(T);
+      // YK, CacheK <- XK
+      __memcpy(Y, xk + i * x_row_stride + j, C_ramsize, GDRAM2NRAM);
+      __memcpy(yk + i * y_row_stride + k, Y, C_ramsize, NRAM2GDRAM);
+      __memcpy(cache_k + i * max_row_stride + k, Y, C_ramsize, NRAM2GDRAM);
+      // YV, CacheV <- XV
+      __memcpy(Y, xv + i * x_row_stride + j, C_ramsize, GDRAM2NRAM);
+      __memcpy(yv + i * y_row_stride + k, Y, C_ramsize, NRAM2GDRAM);
+      __memcpy(cache_v + i * max_row_stride + k, Y, C_ramsize, NRAM2GDRAM);
+    }
+  }
+}
+
+} // namespace
+
+#define DEFINE_KERNEL_LAUNCHER(T)                                    \
+  template <>                                                        \
+  void KVCache<T, MLUContext>(                                       \
+      const int N,                                                   \
+      const int L,                                                   \
+      const int H,                                                   \
+      const int D,                                                   \
+      const int seqlen,                                              \
+      const int max_seqlen,                                          \
+      const string& data_format,                                     \
+      const T* xk,                                                   \
+      const T* xv,                                                   \
+      T* cache_k,                                                    \
+      T* cache_v,                                                    \
+      T* yk,                                                         \
+      T* yv,                                                         \
+      MLUContext* ctx) {                                             \
+    if (data_format == "NLHD") {                                     \
+      NOT_IMPLEMENTED;                                               \
+    } else {                                                         \
+      _KVCacheSeqLast<<<                                             \
+          MLU_BLOCKS(),                                              \
+          CNRT_FUNC_TYPE_BLOCK,                                      \
+          ctx->mlu_stream()>>>(                                      \
+          N * H,                                                     \
+          L,                                                         \
+          D,                                                         \
+          seqlen,                                                    \
+          max_seqlen,                                                \
+          reinterpret_cast<const math::Traits<T>::scalar_type*>(xk), \
+          reinterpret_cast<const math::Traits<T>::scalar_type*>(xv), \
+          reinterpret_cast<math::Traits<T>::scalar_type*>(cache_k),  \
+          reinterpret_cast<math::Traits<T>::scalar_type*>(cache_v),  \
+          reinterpret_cast<math::Traits<T>::scalar_type*>(yk),       \
+          reinterpret_cast<math::Traits<T>::scalar_type*>(yv));      \
+    };                                                               \
+  }
+
+DEFINE_KERNEL_LAUNCHER(float16);
+DEFINE_KERNEL_LAUNCHER(bfloat16);
+DEFINE_KERNEL_LAUNCHER(float);
+DEFINE_KERNEL_LAUNCHER(double)
+#undef DEFINE_KERNEL_LAUNCHER
+#undef BLOCK_THREADS
+
+} // namespace kernels
+
+} // namespace dragon

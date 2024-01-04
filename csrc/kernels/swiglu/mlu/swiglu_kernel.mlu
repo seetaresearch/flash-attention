@@ -1,0 +1,153 @@
+#include <dragon/utils/math_functions.h>
+#include "../../../kernels/swiglu/op_kernels.h"
+
+namespace dragon {
+
+namespace kernels {
+
+namespace {
+
+constexpr static int kBlockThreads = 40960;
+
+template <typename T>
+__mlu_func__ void
+__copy2d(T* dst, const T* src, int C_halve, int K, mluMemcpyDirection_t dir) {
+  __memcpy(
+      dst,
+      src,
+      C_halve * sizeof(T),
+      dir,
+      dir == GDRAM2NRAM ? C_halve * sizeof(T) : 2 * C_halve * sizeof(T),
+      dir == GDRAM2NRAM ? 2 * C_halve * sizeof(T) : C_halve * sizeof(T),
+      K - 1);
+}
+
+template <typename T, int BlockN>
+__mlu_entry__ void _SwiGLU(const int N, const int C_halve, const T* x, T* y) {
+  __nram__ T Y[kBlockThreads];
+  const int x_row_stride = BlockN * 2 * C_halve;
+  const int y_row_stride = BlockN * C_halve;
+  for (int i = taskId; i * BlockN < N; i += taskDim) {
+    T *Y0 = Y, *Y1 = Y + y_row_stride;
+    const int K = std::min(BlockN, N - i * BlockN);
+    const int KxC = K * 2 * C_halve, KxC_halve = K * C_halve;
+    __copy2d(Y1, x + i * x_row_stride + C_halve, C_halve, K, GDRAM2NRAM);
+    __bang_active_sigmoid(Y0, Y1, KxC_halve);
+    __bang_mul(Y1, Y1, Y0, KxC_halve);
+    __copy2d(Y0, x + i * x_row_stride, C_halve, K, GDRAM2NRAM);
+    __bang_mul(Y0, Y0, Y1, KxC_halve);
+    __memcpy(y + i * y_row_stride, Y0, KxC_halve * sizeof(T), NRAM2GDRAM);
+  }
+}
+
+template <typename T, int BlockN>
+__mlu_entry__ void
+_SwiGLUGrad(const int N, const int C_halve, const T* dy, const T* x, T* dx) {
+  __nram__ T X[kBlockThreads], dX[kBlockThreads], dY[kBlockThreads];
+  const int x_row_stride = BlockN * 2 * C_halve;
+  const int y_row_stride = BlockN * C_halve;
+  for (int i = taskId; i * BlockN < N; i += taskDim) {
+    T *X0 = X, *X1 = X + y_row_stride;
+    T *dX0 = dX, *dX1 = dX + y_row_stride, *S = dY + y_row_stride;
+    const int K = std::min(BlockN, N - i * BlockN);
+    const int KxC = K * 2 * C_halve, KxC_halve = K * C_halve;
+    __copy2d(X0, x + i * x_row_stride, C_halve, K, GDRAM2NRAM);
+    __copy2d(X1, x + i * x_row_stride + C_halve, C_halve, K, GDRAM2NRAM);
+    __memcpy(dY, dy + i * y_row_stride, KxC_halve * sizeof(T), GDRAM2NRAM);
+    // dx0 = s * gate * g
+    __bang_active_sigmoid(S, X1, KxC_halve);
+    __bang_mul(dX0, X1, dY, KxC_halve);
+    __bang_mul(dX0, S, dX0, KxC_halve);
+    // dx1 = s * (gate * g + g - s * gate * g) * x
+    __bang_fusion(FUSION_FMA, dX1, X1, dY, dY, KxC_halve, KxC_halve);
+    __bang_fusion(FUSION_FSM, dX1, dX1, dX0, X0, KxC_halve, KxC_halve);
+    __bang_mul(dX1, S, dX1, KxC_halve);
+    __copy2d(dx + i * x_row_stride, dX0, C_halve, K, NRAM2GDRAM);
+    __copy2d(dx + i * x_row_stride + C_halve, dX1, C_halve, K, NRAM2GDRAM);
+  }
+}
+
+#define RETURN_IF_LAUNCHED(name, BlockN, ...)                                 \
+  if (C <= kBlockThreads / BlockN) {                                          \
+    return name<T, BlockN>                                                    \
+        <<<MLU_BLOCKS(N, BlockN), CNRT_FUNC_TYPE_BLOCK, ctx->mlu_stream()>>>( \
+            __VA_ARGS__);                                                     \
+  }
+
+template <typename T>
+void DispatchSwiGLU(
+    const int N,
+    const int C,
+    const T* x,
+    T* y,
+    MLUContext* ctx) {
+  RETURN_IF_LAUNCHED(_SwiGLU, 128, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 64, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 32, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 16, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 8, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 4, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 2, N, C / 2, x, y);
+  RETURN_IF_LAUNCHED(_SwiGLU, 1, N, C / 2, x, y);
+  LOG(FATAL) << "Unsupported number of input channels: " << C;
+}
+
+template <typename T>
+void DispatchSwiGLUGrad(
+    const int N,
+    const int C,
+    const T* dy,
+    const T* x,
+    T* dx,
+    MLUContext* ctx) {
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 128, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 64, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 32, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 16, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 8, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 4, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 2, N, C / 2, dy, x, dx);
+  RETURN_IF_LAUNCHED(_SwiGLUGrad, 1, N, C / 2, dy, x, dx);
+  LOG(FATAL) << "Unsupported number of input channels: " << C;
+}
+
+#undef RETURN_IF_LAUNCHED
+
+} // namespace
+
+#define DEFINE_KERNEL_LAUNCHER(T)                                    \
+  template <>                                                        \
+  void SwiGLU<T, MLUContext>(                                        \
+      const int N, const int C, const T* x, T* y, MLUContext* ctx) { \
+    using ScalarT = math::Traits<T>::scalar_type;                    \
+    DispatchSwiGLU(N, C, (const ScalarT*)x, (ScalarT*)y, ctx);       \
+  }
+
+#define DEFINE_GRAD_KERNEL_LAUNCHER(T)                                   \
+  template <>                                                            \
+  void SwiGLUGrad<T, MLUContext>(                                        \
+      const int N,                                                       \
+      const int C,                                                       \
+      const T* dy,                                                       \
+      const T* x,                                                        \
+      T* dx,                                                             \
+      MLUContext* ctx) {                                                 \
+    using ScalarT = math::Traits<T>::scalar_type;                        \
+    DispatchSwiGLUGrad(                                                  \
+        N, C, (const ScalarT*)dy, (const ScalarT*)x, (ScalarT*)dx, ctx); \
+  }
+
+DEFINE_KERNEL_LAUNCHER(float16);
+DEFINE_KERNEL_LAUNCHER(bfloat16);
+DEFINE_KERNEL_LAUNCHER(float);
+DEFINE_KERNEL_LAUNCHER(double);
+DEFINE_GRAD_KERNEL_LAUNCHER(float16);
+DEFINE_GRAD_KERNEL_LAUNCHER(bfloat16);
+DEFINE_GRAD_KERNEL_LAUNCHER(float);
+DEFINE_GRAD_KERNEL_LAUNCHER(double);
+#undef DEFINE_KERNEL_LAUNCHER
+#undef DEFINE_GRAD_KERNEL_LAUNCHER
+
+} // namespace kernels
+
+} // namespace dragon
